@@ -1,11 +1,15 @@
 import os
+import re
 import json
 import time
+import uuid
+import shutil
 import random
 import threading
 import traceback
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 
 import undetected_chromedriver as uc
 from undetected_chromedriver import patcher
@@ -13,7 +17,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# ---------- termux patch ----------
+# ---------- patch ----------
 _orig_init = patcher.Patcher.__init__
 def _patched_init(self, *args, **kwargs):
     _orig_init(self, *args, **kwargs)
@@ -24,21 +28,35 @@ patcher.Patcher.__init__ = _patched_init
 # ---------- config ----------
 TOKEN_FILE        = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tokens.json")
 TOKEN_TTL_SEC     = 20 * 60
-MIN_POOL          = 30          # keep at least this many ready
-MAX_POOL          = 250        # hard ceiling on stored tokens
-TARGET_POOL       = 50         # refiller keeps topping up to here
-WORKERS           = 2          # start conservative for termux
-MAX_WORKERS       = 2          # never exceed this on mobile
+MIN_POOL          = 30
+MAX_POOL          = 250
+TARGET_POOL       = 50
+WORKERS           = 1          # Render free tier = 512 MB RAM
+MAX_WORKERS       = 1
 REFILL_INTERVAL   = 30
 HARVEST_TIMEOUT   = 120
 
+CHROMIUM_PATH     = "/usr/bin/chromium"
+CHROMEDRIVER_PATH = "/usr/bin/chromedriver"
+
 _pool_lock      = threading.Lock()
-_harvest_sem    = threading.Semaphore(WORKERS)   # caps concurrent chromes
+_harvest_sem    = threading.Semaphore(WORKERS)
 _stop_flag      = threading.Event()
 _stats_lock     = threading.Lock()
+_start_lock     = threading.Lock()
 _stats = {"harvested": 0, "failed": 0, "purged": 0, "running": 0}
 
-# ---------- token store (same as before) ----------
+
+def _chrome_major():
+    try:
+        out = subprocess.check_output([CHROMIUM_PATH, "--version"]).decode()
+        return int(re.search(r"(\d+)\.", out).group(1))
+    except Exception:
+        return None
+
+CHROME_MAJOR = _chrome_major()
+
+# ---------- token store ----------
 def _now(): return int(time.time())
 
 def _load_pool():
@@ -87,7 +105,7 @@ def _push_token(entry):
 # ---------- driver / harvest ----------
 def make_driver():
     opts = uc.ChromeOptions()
-    opts.binary_location = "/usr/bin/chromium"
+    opts.binary_location = CHROMIUM_PATH
     for a in (
         "--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
         "--ignore-certificate-errors", "--disable-blink-features=AutomationControlled",
@@ -98,13 +116,31 @@ def make_driver():
         "--window-size=412,915",
     ):
         opts.add_argument(a)
-    return uc.Chrome(
+
+    # private copy of chromedriver so patching never collides
+    drv = f"/tmp/chromedriver_{uuid.uuid4().hex}"
+    shutil.copy(CHROMEDRIVER_PATH, drv)
+    os.chmod(drv, 0o755)
+
+    kwargs = dict(
         options=opts,
-        driver_executable_path="/usr/bin/chromedriver",
-        browser_executable_path="/usr/bin/chromium",
+        driver_executable_path=drv,
+        browser_executable_path=CHROMIUM_PATH,
         use_subprocess=True,
         patcher_force_close=True,
     )
+    if CHROME_MAJOR:
+        kwargs["version_main"] = CHROME_MAJOR
+
+    try:
+        with _start_lock:
+            d = uc.Chrome(**kwargs)
+    except Exception:
+        try: os.remove(drv)
+        except Exception: pass
+        raise
+    d._drv_copy = drv
+    return d
 
 def _install_hook(driver):
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": """
@@ -185,12 +221,13 @@ def harvest_one(prompt_text="Hi"):
         if driver:
             try: driver.quit()
             except Exception: pass
+            try: os.remove(driver._drv_copy)
+            except Exception: pass
         with _stats_lock: _stats["running"] -= 1
         _harvest_sem.release()
 
-# ---------- bulk harvest with worker pool ----------
+# ---------- bulk harvest ----------
 def bulk_harvest(count):
-    """Kick off `count` harvests across the worker pool. Non-blocking."""
     pool = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="harvest")
 
     def _job():
@@ -198,24 +235,22 @@ def bulk_harvest(count):
         entry = harvest_one()
         if entry:
             _push_token(entry)
+            print(f"[bulk] +1, pool={_pool_size()}", flush=True)
 
     futures = [pool.submit(_job) for _ in range(count)]
     return pool, futures
 
-# ---------- background refiller (single scheduler + worker pool) ----------
+# ---------- background refiller ----------
 def refiller_loop():
-    """Keeps pool topped up to TARGET_POOL. Uses worker pool for parallelism."""
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="refill")
     while not _stop_flag.is_set():
         try:
             size = _pool_size()
             if size < MIN_POOL:
                 deficit = TARGET_POOL - size
-                # submit enough jobs to reach target
                 for _ in range(min(deficit, MAX_WORKERS * 2)):
                     executor.submit(_one_harvest_job)
             elif size < TARGET_POOL:
-                # gentle top-up — one at a time
                 executor.submit(_one_harvest_job)
         except Exception:
             traceback.print_exc()
@@ -226,7 +261,7 @@ def _one_harvest_job():
     entry = harvest_one()
     if entry:
         _push_token(entry)
-        print(f"[refill] +1, pool={_pool_size()}")
+        print(f"[refill] +1, pool={_pool_size()}", flush=True)
 
 def start_refiller():
     t = threading.Thread(target=refiller_loop, daemon=True, name="vqd-scheduler")
@@ -236,14 +271,19 @@ def start_refiller():
 # ---------- flask ----------
 app = Flask(__name__)
 start_refiller()
+
+@app.route("/", methods=["GET"])
+def home():
+    return "ok"
+
 @app.route("/token", methods=["GET"])
 def get_token():
     token, pool_left = _pop_fresh_token()
     if token is None:
         return jsonify({
             "success": False,
-            "error": "no token — bulk-harvest to warm the pool",
-            "hint":   "POST /harvest?count=100",
+            "error": "no token - harvest to warm the pool",
+            "hint":   "GET /harvest?count=3",
         }), 503
     return jsonify({
         "success": True,
@@ -256,18 +296,15 @@ def get_token():
 
 @app.route("/harvest", methods=["POST", "GET"])
 def harvest_endpoint():
-    """Bulk harvest — fire and forget. Returns immediately."""
-    from flask import request
     try: count = int(request.args.get("count", 10))
     except ValueError: count = 10
     count = max(1, min(count, MAX_POOL * 2))
 
-    # pre-check: don't hammer if pool is already full
     current = _pool_size()
     if current >= MAX_POOL:
         return jsonify({"success": True, "message": "pool full", "size": current})
 
-    pool, futures = bulk_harvest(count)
+    bulk_harvest(count)
     return jsonify({
         "success": True,
         "message": f"queued {count} harvests",
@@ -288,6 +325,7 @@ def pool_status():
         "max": MAX_POOL,
         "workers": WORKERS,
         "max_workers": MAX_WORKERS,
+        "chrome_major": CHROME_MAJOR,
         "stats": s,
         "tokens": [
             {"created_at": t["created_at"], "age_sec": _now() - t["created_at"]}
