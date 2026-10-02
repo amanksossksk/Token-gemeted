@@ -87,7 +87,7 @@ def _push_token(entry):
 # ---------- driver / harvest ----------
 def make_driver():
     opts = uc.ChromeOptions()
-    opts.binary_location = "/data/data/com.termux/files/usr/bin/chromium-browser"
+    opts.binary_location = "/usr/bin/chromium"
     for a in (
         "--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
         "--ignore-certificate-errors", "--disable-blink-features=AutomationControlled",
@@ -100,9 +100,8 @@ def make_driver():
         opts.add_argument(a)
     return uc.Chrome(
         options=opts,
-        driver_executable_path="/data/data/com.termux/files/usr/bin/chromedriver",
-        browser_executable_path="/data/data/com.termux/files/usr/bin/chromium-browser",
-        version_main=140,
+        driver_executable_path="/usr/bin/chromedriver",
+        browser_executable_path="/usr/bin/chromium",
         use_subprocess=True,
         patcher_force_close=True,
     )
