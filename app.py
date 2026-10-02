@@ -235,7 +235,7 @@ def start_refiller():
 
 # ---------- flask ----------
 app = Flask(__name__)
-
+start_refiller()
 @app.route("/token", methods=["GET"])
 def get_token():
     token, pool_left = _pop_fresh_token()
@@ -305,5 +305,4 @@ def force_purge():
                     "remaining": len(after)})
 
 if __name__ == "__main__":
-    start_refiller()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
